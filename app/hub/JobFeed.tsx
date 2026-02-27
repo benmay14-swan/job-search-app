@@ -36,18 +36,26 @@ export default function JobFeed({ initialMatches }: JobFeedProps) {
 
     try {
       const res = await fetch("/api/jobs/search", { method: "POST" });
+      const contentType = res.headers.get("content-type") ?? "";
+      const isSSE = contentType.includes("text/event-stream");
 
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error ?? `Search failed (${res.status})`);
+      // Non-streaming response: treat as a JSON error (auth, config, etc.)
+      if (!res.ok || !isSSE) {
+        const raw = await res.text();
+        let msg = `Search failed (${res.status})`;
+        try {
+          const data = JSON.parse(raw);
+          if (data.error) msg = data.error;
+        } catch { /* ignore — use the generic message */ }
+        throw new Error(msg);
       }
 
-      // Read the SSE stream
+      // Read SSE stream
       const reader = res.body!.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
 
-      while (true) {
+      outer: while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
@@ -56,29 +64,34 @@ export default function JobFeed({ initialMatches }: JobFeedProps) {
         buffer = lines.pop() ?? "";
 
         for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const payload = line.slice(6).trim();
+          // Strip optional carriage return (CRLF safety) and skip non-data lines
+          const clean = line.replace(/\r$/, "");
+          if (!clean.startsWith("data: ")) continue;
+          const payload = clean.slice(6).trim();
           if (!payload) continue;
 
+          // Parse JSON — skip silently on malformed lines
+          let event: Record<string, unknown>;
           try {
-            const event = JSON.parse(payload);
-
-            if (event.status === "searching" || event.status === "saving") {
-              setSearchStatus(event.message ?? "Working…");
-            } else if (event.status === "thinking") {
-              // heartbeat — update status to reassure the user
-              setSearchStatus("Still searching, almost there…");
-            } else if (event.status === "done") {
-              setMatches(event.jobs ?? []);
-              setIsSearching(false);
-              return;
-            } else if (event.status === "error") {
-              throw new Error(event.error ?? "Search failed");
-            }
-          } catch (parseErr) {
-            if (parseErr instanceof SyntaxError) continue;
-            throw parseErr;
+            event = JSON.parse(payload);
+          } catch {
+            continue;
           }
+
+          if (event.status === "searching" || event.status === "saving") {
+            setSearchStatus((event.message as string) ?? "Working…");
+          } else if (event.status === "thinking") {
+            setSearchStatus("Still searching, almost there…");
+          } else if (event.status === "done") {
+            setMatches((event.jobs as JobMatch[]) ?? []);
+            setIsSearching(false);
+            return;
+          } else if (event.status === "error") {
+            // Server reported an error — surface it and stop reading
+            throw new Error((event.error as string) ?? "Search failed");
+          }
+
+          if (event.status === "done") break outer;
         }
       }
     } catch (err) {
