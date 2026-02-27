@@ -1,10 +1,13 @@
-import { NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import type { BetaContentBlock } from "@anthropic-ai/sdk/resources/beta/messages/messages";
 import { createClient } from "@/lib/supabase/server";
 
+// Edge runtime: 30s execution window (vs 10s serverless on Hobby).
+// SSE streaming keeps the connection alive throughout.
+export const runtime = "edge";
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+
+const MIN_MATCH_SCORE = 7;
 
 interface RawJob {
   job_title?: string;
@@ -19,17 +22,32 @@ interface RawJob {
 }
 
 export async function POST() {
+  const encoder = new TextEncoder();
+
+  function sseEvent(data: Record<string, unknown>): Uint8Array {
+    return encoder.encode(`data: ${JSON.stringify(data)}\n\n`);
+  }
+
+  // ── Auth + profile (before stream so we can return HTTP errors normally) ──
   if (!process.env.ANTHROPIC_API_KEY) {
-    return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
+    return new Response(JSON.stringify({ error: "Server configuration error" }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
   }
 
   const supabase = await createClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();
-  if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  // Fetch user profile
+  if (!user) {
+    return new Response(JSON.stringify({ error: "Unauthorized" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
   const { data: profile } = await supabase
     .from("user_profiles")
     .select("*")
@@ -37,10 +55,13 @@ export async function POST() {
     .single();
 
   if (!profile) {
-    return NextResponse.json({ error: "Profile not found" }, { status: 404 });
+    return new Response(JSON.stringify({ error: "Profile not found" }), {
+      status: 404,
+      headers: { "Content-Type": "application/json" },
+    });
   }
 
-  // Build readable strings from profile
+  // ── Build readable profile strings for the prompt ──────────────────────────
   const loc = profile.location_preferences as {
     cities?: string[];
     states?: string[];
@@ -61,137 +82,180 @@ export async function POST() {
         ? `$${Math.round(profile.salary_min / 1000)}k+/year`
         : "flexible";
 
-  const titles = (profile.desired_job_titles as string[] | null)?.join(", ") || "open";
-  const skills = (profile.skills as string[] | null)?.join(", ") || "not specified";
-  const industries = (profile.industries as string[] | null)?.join(", ") || "any";
-  const certs = (profile.certifications_licenses as string[] | null)?.join(", ") || "none";
+  const titles = (profile.desired_job_titles as string[] | null) ?? [];
+  const skills = (profile.skills as string[] | null) ?? [];
+  const industries = (profile.industries as string[] | null) ?? [];
+  const certs = (profile.certifications_licenses as string[] | null) ?? [];
 
-  const searchPrompt = `You are a job search specialist. Use the web_search tool to find 8–10 real, currently open job listings that match this job seeker's profile. Search multiple times with different queries to find diverse, relevant results.
+  const primaryTitle = titles[0] ?? "professional";
 
-JOB SEEKER PROFILE:
-- Desired roles: ${titles}
-- Industries: ${industries}
-- Seniority/Level: ${profile.seniority_level || "not specified"}
-- Years of experience: ${profile.years_experience ?? "not specified"}
-- Key skills: ${skills}
-- Certifications/Licenses required: ${certs}
-- Location preference: ${locationStr}
+  // ── Prompt ─────────────────────────────────────────────────────────────────
+  // We ask for exactly 2–3 targeted searches to keep total time well under 30s.
+  const searchPrompt = `You are a job placement specialist. Search the web to find 6–10 real, currently open job listings that are strong matches for this specific job seeker.
+
+CANDIDATE PROFILE:
+- Target roles: ${titles.join(", ") || "open"}
+- Industries: ${industries.join(", ") || "any"}
+- Seniority: ${profile.seniority_level || "not specified"}
+- Experience: ${profile.years_experience != null ? `${profile.years_experience} years` : "not specified"}
+- Top skills: ${skills.join(", ") || "not specified"}
+- Certifications: ${certs.join(", ") || "none required"}
+- Location: ${locationStr}
 - Salary target: ${salaryStr}
 - Schedule: ${profile.schedule_preferences || "full-time"}
-- Company size preference: ${profile.company_size_preference || "any"}
+- Company size: ${profile.company_size_preference || "any"}
 - Work authorization: ${profile.work_authorization || "not specified"}
-- Deal breakers: ${profile.deal_breakers || "none specified"}
-- Background summary: ${profile.work_history_summary || "not provided"}
+- Deal breakers: ${profile.deal_breakers || "none"}
+- Background: ${profile.work_history_summary || "not provided"}
 
-INSTRUCTIONS:
-1. Search for REAL, currently open job postings. Try queries like:
-   - "${titles.split(",")[0]?.trim()} jobs ${locationStr}"
-   - "${titles.split(",")[0]?.trim()} ${locationStr} site:linkedin.com"
-   - "${titles.split(",")[0]?.trim()} ${locationStr} site:indeed.com"
-   - Use additional skills/industry-specific searches as needed
-2. Find 8–10 real job listings with actual apply URLs
-3. Score each match 1–10 based on how well it fits THIS specific person
-4. Explain in 1–2 sentences why each job is a good fit for this person specifically
+SEARCH INSTRUCTIONS:
+Run 2–3 focused web searches to find real job postings. Use specific queries like:
+- "${primaryTitle} jobs ${locationStr}"
+- "${primaryTitle} ${skills.slice(0, 2).join(" ")} ${loc?.remote_preference === "remote" ? "remote" : locationStr}"
 
-After searching, return ONLY a valid JSON array (no markdown fences, no extra text before or after the JSON). Each object in the array must follow this exact structure:
+Only include jobs that score 7 or higher out of 10. Be selective.
+
+CRITICAL — MATCH REASON RULES:
+The "match_reason" field MUST be specific to this exact person. It MUST mention actual details from their profile such as:
+- Their specific skills (e.g., "your Python and Spark experience")
+- Their years of experience (e.g., "your ${profile.years_experience ?? "X"} years of experience")
+- Their salary target (e.g., "fits your ${salaryStr} target")
+- Their location/remote preference (e.g., "fully remote which matches your preference")
+- Their background (reference their actual work history if provided)
+Do NOT write generic sentences like "this matches your experience level" or "aligns with your preferences" — those are not acceptable. Every match_reason must be specific and personal.
+
+Return ONLY a valid JSON array (no markdown fences, no text before or after). Schema:
 [
   {
-    "job_title": "exact title from the job posting",
+    "job_title": "exact title from the posting",
     "company": "company name",
     "location": "city, state or Remote",
     "salary_range": "$X–$Y or null if not listed",
-    "job_description": "2–3 sentence description of the role and key requirements",
-    "apply_url": "actual URL to the job posting page",
+    "job_description": "2–3 sentences describing the role and key requirements",
+    "apply_url": "direct URL to the job posting",
     "match_score": 8,
-    "match_reason": "1–2 sentence personalized explanation of why this fits this specific person",
+    "match_reason": "Specific 1–2 sentence reason referencing actual details from this candidate's profile",
     "source": "LinkedIn or Indeed or Glassdoor or Company Site"
   }
 ]`;
 
-  // Call Claude with web search (server tool — Anthropic executes searches internally)
-  const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  // ── SSE stream ──────────────────────────────────────────────────────────────
+  const stream = new ReadableStream({
+    async start(controller) {
+      let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
-  let responseContent: BetaContentBlock[] = [];
-
-  try {
-    const response = await anthropic.beta.messages.create({
-      model: "claude-sonnet-4-6",
-      max_tokens: 8192,
-      tools: [
-        {
-          type: "web_search_20250305",
-          name: "web_search",
-        },
-      ],
-      messages: [{ role: "user", content: searchPrompt }],
-      betas: ["web-search-2025-03-05"],
-    });
-
-    responseContent = response.content;
-  } catch (err) {
-    console.error("Claude web search error:", err);
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : "Job search failed" },
-      { status: 500 }
-    );
-  }
-
-  // Extract text blocks — Claude's final structured response
-  const finalText = responseContent
-    .filter((b): b is Extract<BetaContentBlock, { type: "text" }> => b.type === "text")
-    .map((b) => b.text)
-    .join("");
-
-  // Parse the JSON array from the text
-  let jobs: RawJob[] = [];
-  try {
-    const jsonMatch = finalText.match(/\[[\s\S]*\]/);
-    if (jsonMatch) {
-      const parsed = JSON.parse(jsonMatch[0]);
-      if (Array.isArray(parsed)) {
-        jobs = parsed;
+      function send(data: Record<string, unknown>) {
+        controller.enqueue(sseEvent(data));
       }
-    }
-  } catch (err) {
-    console.error("JSON parse error:", err);
-    console.error("Raw text:", finalText.slice(0, 1000));
-    return NextResponse.json({ error: "Failed to parse job results" }, { status: 500 });
-  }
 
-  if (jobs.length === 0) {
-    console.error("No jobs parsed from text:", finalText.slice(0, 500));
-    return NextResponse.json({ error: "No jobs found" }, { status: 404 });
-  }
+      function startHeartbeat() {
+        heartbeatTimer = setInterval(() => {
+          send({ status: "thinking" });
+        }, 5000);
+      }
 
-  // Delete any existing matches for this user (fresh search replaces old)
-  await supabase.from("job_matches").delete().eq("user_id", user.id);
+      function stopHeartbeat() {
+        if (heartbeatTimer) {
+          clearInterval(heartbeatTimer);
+          heartbeatTimer = null;
+        }
+      }
 
-  // Insert new matches
-  const jobRows = jobs.map((job) => ({
-    user_id: user.id,
-    job_title: job.job_title || "Unknown Position",
-    company: job.company || "Unknown Company",
-    location: job.location ?? null,
-    salary_range: job.salary_range ?? null,
-    job_description: job.job_description ?? null,
-    apply_url: job.apply_url ?? null,
-    match_score:
-      typeof job.match_score === "number"
-        ? Math.min(10, Math.max(1, Math.round(job.match_score)))
-        : 5,
-    match_reason: job.match_reason ?? null,
-    source: job.source ?? null,
-  }));
+      try {
+        // First byte sent immediately — keeps Vercel connection alive
+        send({ status: "searching", message: "Scanning job boards for your profile…" });
+        startHeartbeat();
 
-  const { data: savedJobs, error: insertError } = await supabase
-    .from("job_matches")
-    .insert(jobRows)
-    .select();
+        const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
-  if (insertError) {
-    console.error("Insert error:", insertError);
-    return NextResponse.json({ error: "Failed to save jobs" }, { status: 500 });
-  }
+        const response = await anthropic.beta.messages.create({
+          model: "claude-sonnet-4-6",
+          max_tokens: 4096,
+          tools: [
+            {
+              type: "web_search_20250305",
+              name: "web_search",
+            },
+          ],
+          messages: [{ role: "user", content: searchPrompt }],
+          betas: ["web-search-2025-03-05"],
+        });
 
-  return NextResponse.json({ jobs: savedJobs, count: savedJobs?.length ?? 0 });
+        stopHeartbeat();
+        send({ status: "saving", message: "Scoring and saving your matches…" });
+
+        // Extract final text from response
+        const finalText = (response.content as BetaContentBlock[])
+          .filter((b): b is Extract<BetaContentBlock, { type: "text" }> => b.type === "text")
+          .map((b) => b.text)
+          .join("");
+
+        // Parse JSON array
+        let rawJobs: RawJob[] = [];
+        const jsonMatch = finalText.match(/\[[\s\S]*\]/);
+        if (jsonMatch) {
+          try {
+            const parsed = JSON.parse(jsonMatch[0]);
+            if (Array.isArray(parsed)) rawJobs = parsed;
+          } catch {
+            // ignore parse error — will result in empty array
+          }
+        }
+
+        // Filter to quality matches only (≥ MIN_MATCH_SCORE)
+        const qualityJobs = rawJobs.filter(
+          (j) => typeof j.match_score === "number" && j.match_score >= MIN_MATCH_SCORE
+        );
+
+        if (qualityJobs.length === 0) {
+          send({ status: "error", error: "No strong matches found. Try refreshing or updating your profile." });
+          controller.close();
+          return;
+        }
+
+        // Delete stale matches then insert fresh ones
+        await supabase.from("job_matches").delete().eq("user_id", user.id);
+
+        const jobRows = qualityJobs.map((job) => ({
+          user_id: user.id,
+          job_title: job.job_title || "Unknown Position",
+          company: job.company || "Unknown Company",
+          location: job.location ?? null,
+          salary_range: job.salary_range ?? null,
+          job_description: job.job_description ?? null,
+          apply_url: job.apply_url ?? null,
+          match_score: Math.min(10, Math.max(1, Math.round(job.match_score as number))),
+          match_reason: job.match_reason ?? null,
+          source: job.source ?? null,
+        }));
+
+        const { data: savedJobs, error: insertError } = await supabase
+          .from("job_matches")
+          .insert(jobRows)
+          .select();
+
+        if (insertError) {
+          send({ status: "error", error: "Failed to save matches — please try again." });
+          controller.close();
+          return;
+        }
+
+        send({ status: "done", jobs: savedJobs ?? [] });
+      } catch (err) {
+        stopHeartbeat();
+        const msg = err instanceof Error ? err.message : "Job search failed";
+        send({ status: "error", error: msg });
+      }
+
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      "X-Accel-Buffering": "no", // disable nginx buffering (Vercel proxy)
+    },
+  });
 }

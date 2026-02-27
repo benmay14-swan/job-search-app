@@ -24,6 +24,7 @@ interface JobFeedProps {
 export default function JobFeed({ initialMatches }: JobFeedProps) {
   const [matches, setMatches] = useState<JobMatch[]>(initialMatches);
   const [isSearching, setIsSearching] = useState(false);
+  const [searchStatus, setSearchStatus] = useState<string>("Scanning job boards for your profile…");
   const [searchError, setSearchError] = useState<string | null>(null);
   const [feedbackPending, setFeedbackPending] = useState<Record<string, boolean>>({});
 
@@ -31,14 +32,55 @@ export default function JobFeed({ initialMatches }: JobFeedProps) {
   const runSearch = useCallback(async () => {
     setIsSearching(true);
     setSearchError(null);
+    setSearchStatus("Scanning job boards for your profile…");
+
     try {
       const res = await fetch("/api/jobs/search", { method: "POST" });
+
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error ?? `Search failed (${res.status})`);
       }
-      const data = await res.json();
-      setMatches(data.jobs ?? []);
+
+      // Read the SSE stream
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const payload = line.slice(6).trim();
+          if (!payload) continue;
+
+          try {
+            const event = JSON.parse(payload);
+
+            if (event.status === "searching" || event.status === "saving") {
+              setSearchStatus(event.message ?? "Working…");
+            } else if (event.status === "thinking") {
+              // heartbeat — update status to reassure the user
+              setSearchStatus("Still searching, almost there…");
+            } else if (event.status === "done") {
+              setMatches(event.jobs ?? []);
+              setIsSearching(false);
+              return;
+            } else if (event.status === "error") {
+              throw new Error(event.error ?? "Search failed");
+            }
+          } catch (parseErr) {
+            if (parseErr instanceof SyntaxError) continue;
+            throw parseErr;
+          }
+        }
+      }
     } catch (err) {
       setSearchError(err instanceof Error ? err.message : "Search failed. Please try again.");
     } finally {
@@ -84,11 +126,9 @@ export default function JobFeed({ initialMatches }: JobFeedProps) {
     return (
       <div className="flex flex-col items-center justify-center py-24 text-center">
         <div className="w-14 h-14 rounded-full border-4 border-indigo-100 border-t-indigo-600 animate-spin mb-6" />
-        <p className="text-lg font-semibold text-gray-800">Searching for your jobs…</p>
-        <p className="text-sm text-gray-400 mt-2 max-w-xs">
-          Claude is scanning LinkedIn, Indeed, and more to find listings that match your profile.
-          This takes about 30 seconds.
-        </p>
+        <p className="text-lg font-semibold text-gray-800">Finding your matches…</p>
+        <p className="text-sm text-indigo-500 mt-2 font-medium">{searchStatus}</p>
+        <p className="text-xs text-gray-400 mt-1">Takes about 20–30 seconds</p>
       </div>
     );
   }
