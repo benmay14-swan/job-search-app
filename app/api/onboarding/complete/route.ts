@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@/lib/supabase/server";
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+export const dynamic = "force-dynamic";
 
 // Hardcoded opener matches what the client shows — include for full context
 const OPENER =
@@ -39,6 +39,12 @@ Return this exact JSON structure. Use null for any field not discussed. Use [] f
 }`;
 
 export async function POST() {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.error("ANTHROPIC_API_KEY is not set");
+    return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
+  }
+
+  const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const supabase = await createClient();
   const {
     data: { user },

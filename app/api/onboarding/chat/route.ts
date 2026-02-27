@@ -2,7 +2,8 @@ import { NextRequest } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@/lib/supabase/server";
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 const ONBOARDING_SYSTEM_PROMPT = `You are a warm, expert career coach helping job seekers find their ideal role. Your goal is to have a natural, friendly conversation to understand exactly what this person is looking for in their next job, so you can find excellent matches for them.
 
@@ -56,6 +57,17 @@ CONVERSATION FLOW:
 IMPORTANT: Only include <ONBOARDING_COMPLETE> after the user has confirmed your summary. Never rush — comprehensive information leads to better job matches.`;
 
 export async function POST(request: NextRequest) {
+  // Validate API key up front — gives a clear 500 rather than a silent stream failure
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.error("ANTHROPIC_API_KEY is not set");
+    return new Response(
+      JSON.stringify({ error: "Server configuration error" }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
   const supabase = await createClient();
   const {
     data: { user },
@@ -103,8 +115,6 @@ export async function POST(request: NextRequest) {
 
   const history = (dbMessages ?? []) as { role: string; content: string }[];
 
-  // Anthropic requires messages to alternate and start with 'user'.
-  // Our DB always starts with a user message (first send), so this is guaranteed.
   const claudeMessages: Anthropic.Messages.MessageParam[] = history.map(
     (m) => ({
       role: m.role as "user" | "assistant",
@@ -112,69 +122,63 @@ export async function POST(request: NextRequest) {
     })
   );
 
-  // Set up streaming
+  // Use async iterator — more reliable than EventEmitter in serverless environments
   const encoder = new TextEncoder();
-  let fullContent = "";
-
-  const stream = anthropic.messages.stream({
-    model: "claude-sonnet-4-6",
-    max_tokens: 1024,
-    system: ONBOARDING_SYSTEM_PROMPT,
-    messages: claudeMessages,
-  });
 
   const readable = new ReadableStream({
-    start(controller) {
-      stream.on("text", (text) => {
-        fullContent += text;
-        controller.enqueue(
-          encoder.encode(`data: ${JSON.stringify({ text })}\n\n`)
-        );
-      });
+    async start(controller) {
+      let fullContent = "";
 
-      stream
-        .finalMessage()
-        .then(async () => {
-          // Save assistant message to DB before signalling done
-          if (fullContent) {
-            const hasCompletionTag = fullContent.includes(
-              "<ONBOARDING_COMPLETE>"
-            );
-            // Strip the control tag before storing
-            const contentToStore = fullContent
-              .replace("<ONBOARDING_COMPLETE>", "")
-              .trim();
+      try {
+        const stream = anthropic.messages.stream({
+          model: "claude-sonnet-4-6",
+          max_tokens: 1024,
+          system: ONBOARDING_SYSTEM_PROMPT,
+          messages: claudeMessages,
+        });
 
-            await supabase.from("onboarding_messages").insert({
-              user_id: user.id,
-              role: "assistant",
-              content: contentToStore,
-            });
-
-            // Signal done with completion status
+        for await (const event of stream) {
+          if (
+            event.type === "content_block_delta" &&
+            event.delta.type === "text_delta"
+          ) {
+            const text = event.delta.text;
+            fullContent += text;
             controller.enqueue(
-              encoder.encode(
-                `data: ${JSON.stringify({ done: true, complete: hasCompletionTag })}\n\n`
-              )
-            );
-          } else {
-            controller.enqueue(
-              encoder.encode(
-                `data: ${JSON.stringify({ done: true, complete: false })}\n\n`
-              )
+              encoder.encode(`data: ${JSON.stringify({ text })}\n\n`)
             );
           }
-          controller.close();
-        })
-        .catch((err) => {
-          console.error("Anthropic stream error:", err);
-          controller.enqueue(
-            encoder.encode(
-              `data: ${JSON.stringify({ error: "Stream failed" })}\n\n`
-            )
-          );
-          controller.close();
-        });
+        }
+
+        // Save assistant message to DB
+        const hasCompletionTag = fullContent.includes("<ONBOARDING_COMPLETE>");
+        const contentToStore = fullContent
+          .replace("<ONBOARDING_COMPLETE>", "")
+          .trim();
+
+        if (contentToStore) {
+          await supabase.from("onboarding_messages").insert({
+            user_id: user.id,
+            role: "assistant",
+            content: contentToStore,
+          });
+        }
+
+        controller.enqueue(
+          encoder.encode(
+            `data: ${JSON.stringify({ done: true, complete: hasCompletionTag })}\n\n`
+          )
+        );
+      } catch (err) {
+        console.error("Anthropic stream error:", err);
+        controller.enqueue(
+          encoder.encode(
+            `data: ${JSON.stringify({ error: "Stream failed" })}\n\n`
+          )
+        );
+      } finally {
+        controller.close();
+      }
     },
   });
 
