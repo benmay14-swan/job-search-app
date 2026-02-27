@@ -241,8 +241,17 @@ export default function OnboardingChat({
           {/* Error */}
           {error && (
             <div className="flex justify-center">
-              <div className="bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-2 rounded-xl">
-                {error}
+              <div className="bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-xl max-w-md text-center">
+                <p className="font-medium">Something went wrong</p>
+                <p className="mt-1 text-red-600">{error}</p>
+                {(error.toLowerCase().includes("credit") ||
+                  error.toLowerCase().includes("billing") ||
+                  error.toLowerCase().includes("balance")) && (
+                  <p className="mt-2 text-xs text-red-500">
+                    The AI service account is out of credits. Please contact
+                    support or update the API key.
+                  </p>
+                )}
               </div>
             </div>
           )}

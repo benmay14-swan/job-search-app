@@ -171,9 +171,15 @@ export async function POST(request: NextRequest) {
         );
       } catch (err) {
         console.error("Anthropic stream error:", err);
+        let errorMessage = "Stream failed";
+        if (err instanceof Anthropic.APIError) {
+          errorMessage = err.message ?? `Anthropic API error (${err.status})`;
+        } else if (err instanceof Error) {
+          errorMessage = err.message;
+        }
         controller.enqueue(
           encoder.encode(
-            `data: ${JSON.stringify({ error: "Stream failed" })}\n\n`
+            `data: ${JSON.stringify({ error: errorMessage })}\n\n`
           )
         );
       } finally {
