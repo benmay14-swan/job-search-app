@@ -21,6 +21,38 @@ interface RawJob {
   source?: string | null;
 }
 
+/**
+ * The Anthropic SDK throws errors whose `.message` looks like:
+ *   "429 {"type":"error","error":{"type":"rate_limit_error","message":"..."},...}"
+ * Extract the inner human-readable message and map it to a friendly string.
+ */
+function extractErrorMessage(err: unknown): string {
+  if (!(err instanceof Error)) return "Job search failed. Please try again.";
+
+  // Try to pull JSON out of the SDK error string (format: "NNN {...}")
+  const jsonStart = err.message.indexOf("{");
+  if (jsonStart !== -1) {
+    try {
+      const parsed = JSON.parse(err.message.slice(jsonStart));
+      const inner: string = parsed?.error?.message ?? "";
+      if (inner) {
+        if (/rate.?limit/i.test(inner))
+          return "Rate limit reached — please wait a minute and try again.";
+        if (/overload/i.test(inner))
+          return "The AI service is temporarily busy. Please try again shortly.";
+        if (/credit|billing|balance/i.test(inner))
+          return "The AI service account needs attention — please check your API credits.";
+        // Return the raw inner message if it's a short, readable string
+        if (inner.length < 200) return inner;
+      }
+    } catch { /* fall through */ }
+  }
+
+  // Short raw messages are safe to show; long ones are replaced with generic text
+  if (err.message.length < 150) return err.message;
+  return "Job search failed. Please try again.";
+}
+
 export async function POST() {
   const encoder = new TextEncoder();
 
@@ -90,8 +122,7 @@ export async function POST() {
   const primaryTitle = titles[0] ?? "professional";
 
   // ── Prompt ─────────────────────────────────────────────────────────────────
-  // We ask for exactly 2–3 targeted searches to keep total time well under 30s.
-  const searchPrompt = `You are a job placement specialist. Search the web to find 6–10 real, currently open job listings that are strong matches for this specific job seeker.
+  const searchPrompt = `You are a job placement specialist. Search the web to find real, currently open job listings that are strong matches for this candidate. Aim for 3–6 high-quality verified matches. Fewer perfect results are far better than more results with bad links.
 
 CANDIDATE PROFILE:
 - Target roles: ${titles.join(", ") || "open"}
@@ -109,22 +140,51 @@ CANDIDATE PROFILE:
 - Background: ${profile.work_history_summary || "not provided"}
 
 SEARCH INSTRUCTIONS:
-Run 2–3 focused web searches to find real job postings. Use specific queries like:
-- "${primaryTitle} jobs ${locationStr}"
-- "${primaryTitle} ${skills.slice(0, 2).join(" ")} ${loc?.remote_preference === "remote" ? "remote" : locationStr}"
+Run 2–3 focused web searches. Suggested queries:
+- "${primaryTitle} jobs ${locationStr} posted this week"
+- "${primaryTitle} ${skills.slice(0, 2).join(" ")} ${loc?.remote_preference === "remote" ? "remote" : locationStr} site:linkedin.com OR site:greenhouse.io OR site:lever.co"
 
-Only include jobs that score 7 or higher out of 10. Be selective.
+━━━ STRICT URL VERIFICATION — Read carefully before including any job ━━━
 
-CRITICAL — MATCH REASON RULES:
-The "match_reason" field MUST be specific to this exact person. It MUST mention actual details from their profile such as:
-- Their specific skills (e.g., "your Python and Spark experience")
-- Their years of experience (e.g., "your ${profile.years_experience ?? "X"} years of experience")
-- Their salary target (e.g., "fits your ${salaryStr} target")
-- Their location/remote preference (e.g., "fully remote which matches your preference")
-- Their background (reference their actual work history if provided)
-Do NOT write generic sentences like "this matches your experience level" or "aligns with your preferences" — those are not acceptable. Every match_reason must be specific and personal.
+For EACH job you find, you MUST verify two things before including it:
 
-Return ONLY a valid JSON array (no markdown fences, no text before or after). Schema:
+1. DIRECT POSTING URL REQUIRED
+   You must find the exact URL of the specific job description page — not a
+   search results page, not a company homepage, not a generic /careers page.
+
+   ✅ VALID URL patterns (include the job):
+      linkedin.com/jobs/view/1234567890
+      greenhouse.io/company-name/jobs/7654321
+      lever.co/company/abc123de-f456-...
+      jobs.ashbyhq.com/company/uuid-here
+      company.com/careers/job-title-city-12345
+      indeed.com/viewjob?jk=abc123def456  ← must have jk= param
+
+   ❌ INVALID URL patterns (DISCARD the job entirely):
+      linkedin.com/jobs/search/?keywords=...  ← search page
+      indeed.com/jobs?q=engineer&l=NYC        ← search page
+      company.com/careers                     ← generic careers page
+      company.com                             ← homepage
+      glassdoor.com/Jobs/...                  ← listing index
+
+2. RECENT POST DATE REQUIRED
+   The job must have been posted within the last 30 days. If you cannot
+   confirm a post date from the search results or job page, SKIP the job.
+
+━━━ QUALITY RULE ━━━
+3–5 verified matches > 8 matches with uncertain URLs or stale dates.
+Do NOT pad the results. If you can only verify 3 great matches, return 3.
+
+━━━ MATCH REASON RULES ━━━
+"match_reason" MUST reference specific details from this person's profile:
+- Named skills (e.g., "your Python and Spark experience")
+- Years of experience (e.g., "your ${profile.years_experience ?? "X"} years in the field")
+- Salary alignment (e.g., "the listed $X–$Y range fits your ${salaryStr} target")
+- Location/remote match (e.g., "fully remote, matching your preference")
+- Their background (reference actual work history if provided)
+Generic phrases like "matches your experience level" are NOT acceptable.
+
+Return ONLY a valid JSON array (no markdown fences, no text outside the JSON):
 [
   {
     "job_title": "exact title from the posting",
@@ -132,10 +192,10 @@ Return ONLY a valid JSON array (no markdown fences, no text before or after). Sc
     "location": "city, state or Remote",
     "salary_range": "$X–$Y or null if not listed",
     "job_description": "2–3 sentences describing the role and key requirements",
-    "apply_url": "direct URL to the job posting",
+    "apply_url": "DIRECT job posting URL — must pass the verification rules above",
     "match_score": 8,
-    "match_reason": "Specific 1–2 sentence reason referencing actual details from this candidate's profile",
-    "source": "LinkedIn or Indeed or Glassdoor or Company Site"
+    "match_reason": "1–2 sentence reason citing specific skills/experience/preferences from this person's profile",
+    "source": "LinkedIn or Indeed or Greenhouse or Lever or Company Site"
   }
 ]`;
 
@@ -243,8 +303,7 @@ Return ONLY a valid JSON array (no markdown fences, no text before or after). Sc
         send({ status: "done", jobs: savedJobs ?? [] });
       } catch (err) {
         stopHeartbeat();
-        const msg = err instanceof Error ? err.message : "Job search failed";
-        send({ status: "error", error: msg });
+        send({ status: "error", error: extractErrorMessage(err) });
       }
 
       controller.close();

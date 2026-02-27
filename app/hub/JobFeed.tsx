@@ -26,12 +26,14 @@ export default function JobFeed({ initialMatches }: JobFeedProps) {
   const [isSearching, setIsSearching] = useState(false);
   const [searchStatus, setSearchStatus] = useState<string>("Scanning job boards for your profile…");
   const [searchError, setSearchError] = useState<string | null>(null);
+  const [errorDismissed, setErrorDismissed] = useState(false);
   const [feedbackPending, setFeedbackPending] = useState<Record<string, boolean>>({});
 
   // Auto-trigger search on first load if no matches exist
   const runSearch = useCallback(async () => {
     setIsSearching(true);
     setSearchError(null);
+    setErrorDismissed(false);
     setSearchStatus("Scanning job boards for your profile…");
 
     try {
@@ -186,18 +188,29 @@ export default function JobFeed({ initialMatches }: JobFeedProps) {
 
   return (
     <div>
+      {/* Refresh-failed banner — only shown when a re-search fails with existing results */}
+      {searchError && !errorDismissed && (
+        <div className="flex items-start justify-between gap-3 bg-amber-50 border border-amber-200 text-amber-800 text-sm rounded-xl px-4 py-3 mb-5">
+          <p><span className="font-medium">Refresh failed:</span> {searchError}</p>
+          <button
+            onClick={() => setErrorDismissed(true)}
+            className="flex-shrink-0 text-amber-500 hover:text-amber-700 transition-colors mt-0.5"
+            aria-label="Dismiss"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-4 h-4">
+              <path d="M5.28 4.22a.75.75 0 00-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 101.06 1.06L8 9.06l2.72 2.72a.75.75 0 101.06-1.06L9.06 8l2.72-2.72a.75.75 0 00-1.06-1.06L8 6.94 5.28 4.22z" />
+            </svg>
+          </button>
+        </div>
+      )}
+
       {/* Header row */}
       <div className="flex items-center justify-between mb-6">
-        <div>
-          <p className="text-sm text-gray-500">
-            {matches.length} match{matches.length !== 1 ? "es" : ""} found
-            {liked > 0 && ` · ${liked} liked`}
-            {disliked > 0 && ` · ${disliked} skipped`}
-          </p>
-          {searchError && (
-            <p className="text-xs text-amber-600 mt-0.5">{searchError}</p>
-          )}
-        </div>
+        <p className="text-sm text-gray-500">
+          {matches.length} match{matches.length !== 1 ? "es" : ""} found
+          {liked > 0 && ` · ${liked} liked`}
+          {disliked > 0 && ` · ${disliked} skipped`}
+        </p>
         <button
           onClick={runSearch}
           disabled={isSearching}
