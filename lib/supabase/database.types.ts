@@ -6,7 +6,16 @@ export type Json =
   | { [key: string]: Json | undefined }
   | Json[];
 
-export interface Database {
+// GenericRelationship shape required by supabase-js v2.9x+
+type Rel = {
+  foreignKeyName: string;
+  columns: string[];
+  isOneToOne?: boolean;
+  referencedRelation: string;
+  referencedColumns: string[];
+};
+
+export type Database = {
   public: {
     Tables: {
       user_profiles: {
@@ -73,6 +82,7 @@ export interface Database {
           onboarding_complete?: boolean;
           last_updated?: string;
         };
+        Relationships: Rel[];
       };
       job_matches: {
         Row: {
@@ -129,6 +139,7 @@ export interface Database {
           cover_letter_generated?: boolean;
           created_at?: string;
         };
+        Relationships: Rel[];
       };
       onboarding_messages: {
         Row: {
@@ -152,16 +163,12 @@ export interface Database {
           content?: string;
           created_at?: string;
         };
+        Relationships: Rel[];
       };
     };
-    Views: {
-      [_ in never]: never;
-    };
-    Functions: {
-      [_ in never]: never;
-    };
-    Enums: {
-      [_ in never]: never;
-    };
+    Views: Record<string, never>;
+    Functions: Record<string, never>;
+    Enums: Record<string, never>;
+    CompositeTypes: Record<string, never>;
   };
-}
+};
