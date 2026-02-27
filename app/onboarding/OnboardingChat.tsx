@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import LogoutButton from "@/app/components/LogoutButton";
 
 interface Message {
   role: "user" | "assistant";
@@ -68,7 +69,12 @@ export default function OnboardingChat({
       }
 
       if (!response.ok) {
-        throw new Error(`Server error: ${response.status}`);
+        let msg = `Server error: ${response.status}`;
+        try {
+          const data = await response.json();
+          if (data.error) msg = data.error;
+        } catch {}
+        throw new Error(msg);
       }
 
       const reader = response.body!.getReader();
@@ -130,7 +136,9 @@ export default function OnboardingChat({
       console.error("Chat error:", err);
       setIsStreaming(false);
       setStreamingText("");
-      setError("Something went wrong. Please try again.");
+      setError(
+        err instanceof Error ? err.message : "Something went wrong. Please try again."
+      );
     }
   }
 
@@ -204,6 +212,7 @@ export default function OnboardingChat({
             ✓ Done
           </div>
         )}
+        <LogoutButton />
       </header>
 
       {/* ── Messages ── */}
